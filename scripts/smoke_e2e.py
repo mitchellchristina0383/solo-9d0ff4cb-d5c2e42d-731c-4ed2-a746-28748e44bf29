@@ -67,7 +67,8 @@ def start_server(work: Path, mount: Path) -> subprocess.Popen:
     env = os.environ.copy()
     env["MERGE_MOUNT_DIR"] = str(mount)
     env["MERGE_WORK_DIR"] = str(work)
-    env["PYTHONPATH"] = str(ROOT)
+    # 追加而非覆盖，避免丢掉调用方已有的 PYTHONPATH（如外置依赖目录）
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app",
          "--host", "127.0.0.1", "--port", "8765", "--log-level", "warning"],

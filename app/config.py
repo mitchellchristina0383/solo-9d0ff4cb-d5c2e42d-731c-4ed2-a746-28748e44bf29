@@ -13,9 +13,14 @@ class Settings:
     mount_dir: Path
     # 作业状态与已发布页的持久化目录
     work_dir: Path
+    # 可选崩溃注入点（仅测试/冒烟用）：取值见 app.engine 的崩溃注入注释
+    crash_hook: str | None = None
 
     @staticmethod
     def from_env() -> "Settings":
         mount = Path(os.environ.get("MERGE_MOUNT_DIR", "./sample/input")).resolve()
         work = Path(os.environ.get("MERGE_WORK_DIR", "./data")).resolve()
-        return Settings(mount_dir=mount, work_dir=work)
+        crash_hook = os.environ.get("MERGE_CRASH_HOOK") or None
+        return Settings(
+            mount_dir=mount, work_dir=work, crash_hook=crash_hook
+        )

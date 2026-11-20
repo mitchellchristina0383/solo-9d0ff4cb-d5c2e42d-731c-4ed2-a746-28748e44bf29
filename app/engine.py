@@ -8,11 +8,13 @@
 2. 页是发布单元：先写 ``page-XXXXX.jsonl.tmp``，fsync 后原子
    ``os.replace`` 成正式页文件，再写新的 ``state.json``（同样
    tmp + fsync + replace）。任何时刻崩溃，已发布页都保持原样。
-3. 回收（两阶段提交）：某路全部记录随页发布后，先提交
-   ``exhausted + 偏移`` 状态，再 unlink 段文件，最后提交
-   ``reclaimed`` 标记。任何一步崩溃，重启时 ``_open_job`` 都能
-   依据状态对账并补做回收；“未消费但段文件缺失”不可能由本服务
-   自身的崩溃产生。
+3. 回收（两阶段提交 + 文件身份围栏）：某路全部记录随页发布后，
+   先提交 ``exhausted + 偏移`` 状态，再 **核对当前路径上的文件
+   与登记时捕获的身份（``FileIdentity``）一致** 才 unlink，最后
+   提交 ``reclaimed`` 标记。上游在同路径放下一批段（即使字节
+   完全相同）时，身份核对失败 -> 保留新文件、告警并置
+   ``reclaim_deferred``，旧作业绝不会误删下一批。任何一步崩溃，
+   重启时 ``_open_job`` 都能依据状态对账并补做回收。
 4. 续跑：状态只记录各路下一条待比较记录的字节偏移和已发布页数，
    进程重启后打开文件 ``seek(offset)`` 继续，未发布记录重新参与
    归并，整批不丢不重。
@@ -20,8 +22,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
@@ -30,12 +34,15 @@ from typing import Any, Callable, Iterable
 
 from .models import (
     AdvanceResult,
+    FileIdentity,
     JobCreate,
     JobStatus,
     PageMeta,
     RunResult,
     SegmentState,
 )
+
+logger = logging.getLogger("merge_service")
 
 STATE_FILENAME = "state.json"
 PAGE_PREFIX = "page-"
@@ -159,6 +166,49 @@ class MergeService:
             raise EngineError(f"段路径越出挂载目录: {rel}")
         return p
 
+    # ------------------------------------------------------------------ #
+    # 段文件身份（回收围栏，防止误删上游放下的下一批同名段）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _sha256_of(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _stat_matches(identity: FileIdentity, st: os.stat_result) -> bool:
+        return (
+            st.st_dev == identity.dev
+            and st.st_ino == identity.ino
+            and st.st_size == identity.size
+            and st.st_mtime_ns == identity.mtime_ns
+        )
+
+    def _is_same_file(self, path: Path, identity: FileIdentity) -> bool:
+        """路径上的当前文件是否就是登记时的那一批。
+
+        先比对 stat 身份（dev/inode/size/mtime_ns）；stat 全部吻合时
+        再比对 SHA-256 兜底。两份字节完全相同的替换文件 inode 或
+        mtime 不同，stat 阶段即被拦下，不会被当成同一批。
+        """
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        if not self._stat_matches(identity, st):
+            return False
+        return self._sha256_of(path) == identity.sha256
+
+    def _warn(self, status: JobStatus, message: str) -> bool:
+        """作业级去告警去重并落日志；返回是否为新告警。"""
+        if message in status.warnings:
+            return False
+        status.warnings.append(message)
+        logger.warning("job=%s %s", status.job_id, message)
+        return True
+
     def _read_state(self, job_id: str) -> JobStatus:
         path = self._state_path(job_id)
         if not path.exists():
@@ -206,14 +256,25 @@ class MergeService:
                     return existing
                 raise EngineError(f"作业 {req.job_id} 已存在且登记参数不一致")
 
-            # 校验段文件：存在、可读、键为整数且全局非降序
+            # 校验段文件：存在、可读、键为整数且全局非降序；
+            # 同一次流式扫描顺带计算 SHA-256，登记时固化文件身份
             seg_states: list[SegmentState] = []
             for seg in req.segments:
                 p = self._segment_path(seg.path)
                 if not p.is_file():
                     raise EngineError(f"段文件不存在: {seg.path}")
-                self._validate_sorted_segment(p, req.key_field, seg.path)
-                seg_states.append(SegmentState(path=seg.path, order=seg.order))
+                digest = self._validate_sorted_segment(p, req.key_field, seg.path)
+                st = p.stat()
+                identity = FileIdentity(
+                    dev=st.st_dev,
+                    ino=st.st_ino,
+                    size=st.st_size,
+                    mtime_ns=st.st_mtime_ns,
+                    sha256=digest,
+                )
+                seg_states.append(
+                    SegmentState(path=seg.path, order=seg.order, file_id=identity)
+                )
 
             job_dir.mkdir(parents=True, exist_ok=True)
             status = JobStatus(
@@ -230,11 +291,17 @@ class MergeService:
             self._write_state(req.job_id, status)
             return status
 
-    def _validate_sorted_segment(self, path: Path, key_field: str, rel: str) -> None:
-        """流式校验：每行是 JSON 对象，键为整数，且键非降序。"""
+    def _validate_sorted_segment(self, path: Path, key_field: str, rel: str) -> str:
+        """流式校验：每行是 JSON 对象，键为整数，且键非降序。
+
+        同一次扫描计算整文件 SHA-256 并返回，供登记时固化文件身份，
+        避免为算摘要再读一遍大段。
+        """
+        digest = hashlib.sha256()
         prev: int | None = None
         with open(path, "rb") as f:
             for lineno, raw in enumerate(f, 1):
+                digest.update(raw)
                 if not raw.strip():
                     continue
                 try:
@@ -249,12 +316,16 @@ class MergeService:
                 if prev is not None and key < prev:
                     raise EngineError(f"{rel}:{lineno} 键 {key} 小于前一键 {prev}，段未排序")
                 prev = key
+        return digest.hexdigest()
 
     # ------------------------------------------------------------------ #
     # 启动恢复
     # ------------------------------------------------------------------ #
-    def _open_job(self, job_id: str) -> JobStatus:
-        """载入作业并做崩溃对账，返回恢复后的状态。"""
+    def _open_job(self, job_id: str) -> tuple[JobStatus, list[str], list[str]]:
+        """载入作业并做崩溃对账。
+
+        返回 ``(状态, 本次对账实际删除的段路径, 本次对账保留未删的段路径)``。
+        """
         status = self._read_state(job_id)
         job_dir = self._job_dir(job_id)
 
@@ -270,26 +341,87 @@ class MergeService:
             if no not in valid_pages:
                 pf.unlink()
 
-        # 3) 段文件回收对账：
-        #    - reclaimed=True 但文件还在（unlink 丢失）-> 补删
-        #    - exhausted=True、reclaimed=False 且文件还在
-        #      （两阶段回收的阶段2/3 之间崩溃，文件尚未删或刚删完）-> 补删补标
+        # 3) 段文件回收对账（带文件身份围栏）：
+        #    - exhausted 且尚未 reclaimed：两阶段回收阶段 2/3 之间崩溃，
+        #      或正常推进中尚未执行回收；仅当路径上仍是登记的同一批文件
+        #      才补删补标，否则保留并告警（上游已放下一批）。
+        #    - 已 reclaimed 但文件又出现：同样先核身份，是本批才补删，
+        #      非本批（下一批同名段）一律保留。
+        #    - 旧版状态没有 file_id：无法确认当前文件属于哪一批，
+        #      保留文件并把路径报进 warnings。
         changed = False
+        reclaimed_now: list[str] = []
+        deferred_now: list[str] = []
         for seg in status.segments:
-            if seg.exhausted and not seg.reclaimed:
-                p = self._segment_path(seg.path)
-                if p.exists():
-                    p.unlink()
+            if not seg.exhausted and not seg.reclaimed:
+                continue
+            if seg.reclaim_deferred:
+                # 此前已决定保留：永不回头删它，只保留既有告警
+                continue
+            deleted = self._fenced_unlink(status, seg)
+            if deleted is True:
+                # 确认是本批文件（如 unlink 未落盘的补删）：置回收标记
+                reclaimed_now.append(seg.path)
+                if not seg.reclaimed:
+                    seg.reclaimed = True
+                    changed = True
+            elif deleted is False:
+                # 同路径是非本批文件 / 旧版状态无法确认身份：
+                # 保留文件并置 reclaim_deferred；此前可能误置过
+                # reclaimed=True，以保留决定为准清除它
+                seg.reclaimed = False
+                changed = True
+                deferred_now.append(seg.path)
+            elif seg.exhausted and not seg.reclaimed:
+                # 路径上没有文件且未标回收（正常 unlink 后崩溃的中间态）：补标
                 seg.reclaimed = True
                 changed = True
-            elif seg.reclaimed:
-                p = self._segment_path(seg.path)
-                if p.exists():
-                    p.unlink()
         if changed:
             self._write_state(job_id, status)
 
-        return status
+        return status, reclaimed_now, deferred_now
+
+    def _fenced_unlink(self, status: JobStatus, seg: SegmentState) -> bool | None:
+        """对一个已耗尽段执行带身份围栏的删除。
+
+        返回值：
+          True  -> 确认是登记的同一批文件，已 unlink（调用方置 reclaimed）
+          False -> 同路径存在非本批文件，或旧版状态无法确认身份：
+                   保留文件、置 reclaim_deferred、写入告警
+          None  -> 路径上当前没有文件（无需动作）
+        """
+        p = self._segment_path(seg.path)
+        if not p.exists():
+            return None
+
+        if seg.reclaim_deferred:
+            # 此前已判定同路径为非本批文件（或身份不可确认）并决定保留：
+            # 决定永久有效，之后任何对账都不再回头删除它
+            return None
+
+        if seg.file_id is None:
+            # 旧版状态：没有登记时的文件身份，无法确认当前文件属于哪一批
+            seg.reclaim_deferred = True
+            self._warn(
+                status,
+                f"段 {seg.path}（{p}）的旧版状态缺少文件身份，"
+                "无法确认当前文件属于哪一批，已保留文件、跳过回收",
+            )
+            return False
+
+        if self._is_same_file(p, seg.file_id):
+            p.unlink()
+            _fsync_dir(p.parent)
+            return True
+
+        # 同路径上的文件不是登记的那一批：上游已放入下一批，绝不能删
+        seg.reclaim_deferred = True
+        self._warn(
+            status,
+            f"段 {seg.path}（{p}）与登记的文件身份不一致，"
+            "疑似上游已放入下一批同名段，已保留文件、跳过回收",
+        )
+        return False
 
     # ------------------------------------------------------------------ #
     # 推进一页
@@ -299,14 +431,20 @@ class MergeService:
             return self._advance_locked(job_id)
 
     def _advance_locked(self, job_id: str) -> AdvanceResult:
-        status = self._open_job(job_id)
+        status, reconciled_reclaimed, reconciled_deferred = self._open_job(job_id)
         if status.finished:
+            deferred = list(dict.fromkeys(
+                reconciled_deferred
+                + [s.path for s in status.segments if s.reclaim_deferred]
+            ))
             return AdvanceResult(
                 page_no=None,
                 page_size=status.page_size,
                 rows=0,
                 finished=True,
-                reclaimed=[],
+                reclaimed=reconciled_reclaimed,
+                deferred=deferred,
+                warnings=list(status.warnings),
                 status=status,
             )
 
@@ -315,15 +453,30 @@ class MergeService:
         readers: dict[int, _RunReader] = {}
         heap: list[_HeapEntry] = []
 
-        # 打开每一路，seek 到持久化偏移，载入第一条待比较记录
-        for idx, seg in enumerate(status.segments):
-            if seg.exhausted:
-                continue
+        # 打开每一路，seek 到持久化偏移，载入第一条待比较记录。
+        # 先统一做存在性与文件身份核对（不持有句柄），避免中途报错泄漏 fd。
+        live_segments = [
+            (idx, seg) for idx, seg in enumerate(status.segments) if not seg.exhausted
+        ]
+        for idx, seg in live_segments:
             p = self._segment_path(seg.path)
             if not p.exists():
                 raise EngineError(
-                    f"段文件 {seg.path} 已不存在但作业尚未消费完，无法续跑"
+                    f"段文件 {seg.path}（{p}）已不存在但作业尚未消费完，无法续跑"
                 )
+            # 作业仍在消费该段时，同路径文件必须仍是登记的那一批。
+            # 这里走 stat 快速核对（替换文件会产生新 inode/mtime）；
+            # 回收删除时再用 stat + SHA-256 双重围栏。
+            if seg.file_id is not None and not self._stat_matches(
+                seg.file_id, p.stat()
+            ):
+                raise EngineError(
+                    f"段文件 {seg.path}（{p}）与登记的文件身份不一致，"
+                    "疑似在作业消费期间被替换为其他批次，已保留文件，请人工核对"
+                )
+
+        for idx, seg in live_segments:
+            p = self._segment_path(seg.path)
             f = open(p, "rb")
             f.seek(seg.offset)
             reader = _RunReader(index=idx, state=seg, f=f, seq=0)
@@ -348,13 +501,17 @@ class MergeService:
                 for reader in readers.values():
                     reader.state.exhausted = True
                 status.finished = True
-                reclaimed = self._commit_and_reclaim(job_id, status)
+                reclaimed, deferred = self._commit_and_reclaim(job_id, status)
+                reclaimed = list(dict.fromkeys(reconciled_reclaimed + reclaimed))
+                deferred = list(dict.fromkeys(reconciled_deferred + deferred))
                 return AdvanceResult(
                     page_no=None,
                     page_size=page_size,
                     rows=0,
                     finished=True,
                     reclaimed=reclaimed,
+                    deferred=deferred,
+                    warnings=list(status.warnings),
                     status=status,
                 )
 
@@ -395,10 +552,13 @@ class MergeService:
                 status.finished = True
             status.next_page_no = status.published_pages + 1
 
-            # 4) 先提交“耗尽 + 偏移”状态，再回收段文件，最后补提交
-            #    reclaimed 标记。这样“未消费但段文件缺失”不可能由本
-            #    服务自身的崩溃造成；unlink 后崩溃由启动对账补做回收。
-            reclaimed_now = self._commit_and_reclaim(job_id, status)
+            # 4) 先提交“耗尽 + 偏移”状态，再在文件身份围栏内回收段
+            #    文件，最后补提交 reclaimed/deferred 标记。这样“未消费
+            #    但段文件缺失”不可能由本服务自身的崩溃造成；unlink 后
+            #    崩溃由启动对账补做；同路径出现下一批文件时绝不误删。
+            reclaimed_now, deferred_now = self._commit_and_reclaim(job_id, status)
+            reclaimed_now = list(dict.fromkeys(reconciled_reclaimed + reclaimed_now))
+            deferred_now = list(dict.fromkeys(reconciled_deferred + deferred_now))
 
             return AdvanceResult(
                 page_no=page_no,
@@ -406,6 +566,8 @@ class MergeService:
                 rows=len(page_records),
                 finished=status.finished,
                 reclaimed=reclaimed_now,
+                deferred=deferred_now,
+                warnings=list(status.warnings),
                 status=status,
             )
         finally:
@@ -445,38 +607,58 @@ class MergeService:
         reader.seq += 1
         return entry
 
-    def _commit_and_reclaim(self, job_id: str, status: JobStatus) -> list[str]:
-        """两阶段回收，保证崩溃后可对账：
+    def _commit_and_reclaim(
+        self, job_id: str, status: JobStatus
+    ) -> tuple[list[str], list[str]]:
+        """两阶段回收 + 文件身份围栏，保证崩溃后可对账且不误删新批：
 
         阶段1  先原子提交状态（段已 exhausted、偏移已落盘，reclaimed=False）。
                此后即使段文件被删，重启也知道它已消费完，不会再去读它。
-        阶段2  unlink 段文件；若在这一步后、阶段3 前崩溃，启动时由
-               ``_open_job`` 依据 reclaimed=False 但 exhausted=True 补做对账。
-        阶段3  再次提交状态（reclaimed=True）。正常情况下每次推进至多
-               一个段新耗尽，整作业只额外产生有限次数的状态写。
+        阶段2  对每个新耗尽段调用 :meth:`_fenced_unlink`：仅当路径上仍是
+               登记时的同一批文件（stat 身份 + SHA-256 双核对）才 unlink；
+               同路径已被上游换成下一批（哪怕字节完全相同），或旧版状态
+               没有身份可核对时，保留文件、置 reclaim_deferred 并告警。
+               若在 unlink 之后、阶段3 之前崩溃，启动时由 ``_open_job``
+               依据 exhausted=True、reclaimed=False 补做同样的围栏对账。
+        阶段3  再次提交状态（reclaimed=True / reclaim_deferred=True、
+               warnings 落盘）。
+
+        返回 ``(本次实际删除的路径, 本次保留未删的路径)``。
         """
         # 阶段1：提交耗尽/偏移
         self._write_state(job_id, status)
 
-        # 阶段2：回收段文件
+        # 阶段2：带身份围栏的回收
         reclaimed: list[str] = []
+        deferred: list[str] = []
+        any_unlinked = False
         for seg in status.segments:
-            if seg.exhausted and not seg.reclaimed:
-                p = self._segment_path(seg.path)
-                if p.exists():
-                    p.unlink()
+            if seg.reclaimed or seg.reclaim_deferred or not seg.exhausted:
+                continue
+            outcome = self._fenced_unlink(status, seg)
+            if outcome is True:
+                seg.reclaimed = True
                 reclaimed.append(seg.path)
-        if self._crash_hook is not None and reclaimed:
+                any_unlinked = True
+            elif outcome is False:
+                deferred.append(seg.path)
+            else:
+                if seg.reclaim_deferred:
+                    # 已决定保留的段永不改判为回收
+                    continue
+                # 本批文件已不在路径上（正常情况下不会走到这里，
+                # 因为 exhausted 段此前必然存在）：按已回收补标
+                seg.reclaimed = True
+                reclaimed.append(seg.path)
+
+        # 与历史行为一致：至少真实 unlink 过文件才触发该崩溃注入点
+        if self._crash_hook is not None and any_unlinked:
             self._crash_hook("after_reclaim_unlink")
 
-        # 阶段3：提交回收标记
-        for path in reclaimed:
-            for seg in status.segments:
-                if seg.path == path:
-                    seg.reclaimed = True
-        if reclaimed:
+        # 阶段3：提交回收/保留标记与告警（有变化才写）
+        if reclaimed or deferred:
             self._write_state(job_id, status)
-        return reclaimed
+        return reclaimed, deferred
 
     # ------------------------------------------------------------------ #
     # 整批跑完
@@ -488,15 +670,24 @@ class MergeService:
         因为 threading.Lock 不可重入。
         """
         published: list[int] = []
+        reclaimed: list[str] = []
+        deferred: list[str] = []
         with self._get_lock(job_id):
             while True:
                 result = self._advance_locked(job_id)
                 if result.page_no is not None:
                     published.append(result.page_no)
+                reclaimed.extend(result.reclaimed)
+                for rel in result.deferred:
+                    if rel not in deferred:
+                        deferred.append(rel)
                 if result.finished or (max_pages is not None and len(published) >= max_pages):
                     return RunResult(
                         published=published,
                         finished=result.finished,
+                        reclaimed=reclaimed,
+                        deferred=deferred,
+                        warnings=list(result.status.warnings),
                         status=result.status,
                     )
 

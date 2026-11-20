@@ -42,12 +42,35 @@ class JobCreate(BaseModel):
         return v
 
 
+class FileIdentity(BaseModel):
+    """登记时刻捕获的段文件身份，回收时据此确认当前文件仍是同一批。
+
+    上游在同路径放下一批段时，仅靠路径无法区分新旧文件；
+    ``(dev, ino, size, mtime_ns)`` 标识文件实例，``sha256`` 再兜底
+    内容（两份字节完全相同的文件也能靠 stat 身份区分）。
+    """
+
+    dev: int = Field(..., description="stat.st_dev：所在设备号")
+    ino: int = Field(..., description="stat.st_ino：inode 号")
+    size: int = Field(..., description="登记时文件字节数")
+    mtime_ns: int = Field(..., description="登记时纳秒级修改时间")
+    sha256: str = Field(..., description="登记时整文件内容的 SHA-256")
+
+
 class SegmentState(BaseModel):
     path: str
     order: int
     offset: int = Field(0, description="下一条待处理记录在段文件中的字节偏移")
     exhausted: bool = False
     reclaimed: bool = False
+    file_id: FileIdentity | None = Field(
+        None, description="登记时捕获的段文件身份；旧版状态无此值（None）"
+    )
+    reclaim_deferred: bool = Field(
+        False,
+        description="已耗尽但同路径出现非本批文件（或旧版状态无法确认身份），"
+        "放弃删除并保留文件，等待人工处理",
+    )
 
 
 class JobStatus(BaseModel):
@@ -60,6 +83,10 @@ class JobStatus(BaseModel):
     finished: bool
     next_page_no: int
     page_counts: list[int] = Field(..., description="每页实际行数")
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="保留未删段等需要人工介入的告警（含段路径），去重持久化",
+    )
 
 
 class AdvanceResult(BaseModel):
@@ -67,13 +94,21 @@ class AdvanceResult(BaseModel):
     page_size: int
     rows: int = Field(..., description="本次发布的行数")
     finished: bool
-    reclaimed: list[str] = Field(default_factory=list, description="本次回收的段文件相对路径")
+    reclaimed: list[str] = Field(default_factory=list, description="本次实际删除（回收）的段文件相对路径")
+    deferred: list[str] = Field(
+        default_factory=list,
+        description="本次判定保留、未删除的段文件相对路径（同路径为非本批文件或身份无法确认）",
+    )
+    warnings: list[str] = Field(default_factory=list, description="本次产生或已有的人工介入告警")
     status: JobStatus
 
 
 class RunResult(BaseModel):
     published: list[int] = Field(..., description="本次 run 新发布的页号列表")
     finished: bool
+    reclaimed: list[str] = Field(default_factory=list, description="本次 run 实际删除的段文件相对路径")
+    deferred: list[str] = Field(default_factory=list, description="本次 run 保留未删的段文件相对路径")
+    warnings: list[str] = Field(default_factory=list, description="作业当前的人工介入告警")
     status: JobStatus
 
 

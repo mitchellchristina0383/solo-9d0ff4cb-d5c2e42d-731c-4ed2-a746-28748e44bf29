@@ -17,6 +17,7 @@ GET    /healthz                    健康检查
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -35,8 +36,27 @@ from .models import (
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    # 让引擎的保留段告警在容器日志中可见。uvicorn 已配置 root logger，
+    # basicConfig 此时是空操作，需要显式设置级别并把日志交回 root 传播。
+    engine_logger = logging.getLogger("merge_service")
+    engine_logger.setLevel(logging.WARNING)
+    engine_logger.propagate = True
     settings = settings or Settings.from_env()
-    service = MergeService(mount_dir=settings.mount_dir, work_dir=settings.work_dir)
+
+    crash_hook = None
+    if settings.crash_hook:
+        # 仅用于测试/冒烟：在指定注入点主动抛出，模拟进程在该窗口宕机
+        point = settings.crash_hook
+
+        def crash_hook(hit_point: str) -> None:  # type: ignore[misc]
+            if hit_point == point:
+                raise RuntimeError(f"crash injection at {hit_point}")
+
+    service = MergeService(
+        mount_dir=settings.mount_dir,
+        work_dir=settings.work_dir,
+        crash_hook=crash_hook,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Any:
@@ -50,7 +70,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="1.0.0",
         description=(
             "k 路已排序 JSONL 段的末道归并：逐页发布、单页读取、"
-            "发布后回收段文件，支持进程中断后续跑，不漏不重。"
+            "发布后凭文件身份围栏回收段文件（同路径下一批同名段不会被误删），"
+            "支持进程中断后续跑，不漏不重。"
         ),
         lifespan=lifespan,
     )
